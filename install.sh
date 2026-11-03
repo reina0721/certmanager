@@ -307,10 +307,14 @@ else
     IMAGE_ASSET="certmate-image-linux-${ARCH}.tar.gz"
 
     log "正在获取 Release 部署包: ${BUNDLE_ASSET}..."
-    fetch "${BASE}/${BUNDLE_ASSET}" "${TMP}/${BUNDLE_ASSET}" || die "下载部署包失败: ${BUNDLE_ASSET}"
+    if ! fetch "${BASE}/${BUNDLE_ASSET}" "${TMP}/${BUNDLE_ASSET}"; then
+        die "下载部署包失败: ${BUNDLE_ASSET}。请检查 GitHub Release 是否已发布（当前指定版本: ${VERSION}，仓库: ${REPO}）。若尚未创建 Release，请先在仓库发布 Release Tag（如 v1.0.0）。"
+    fi
 
     log "正在获取离线 Docker 镜像包: ${IMAGE_ASSET}..."
-    fetch "${BASE}/${IMAGE_ASSET}" "${TMP}/${IMAGE_ASSET}" || die "下载镜像包失败: ${IMAGE_ASSET}"
+    if ! fetch "${BASE}/${IMAGE_ASSET}" "${TMP}/${IMAGE_ASSET}"; then
+        die "下载镜像包失败: ${IMAGE_ASSET}。请检查该 Release 资产是否已构建完成。"
+    fi
 
     # 校验和
     if [[ "$INSECURE" -eq 1 || -z "$SHA_CMD" ]]; then

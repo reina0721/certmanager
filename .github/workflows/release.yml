@@ -3,6 +3,12 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (如 v1.0.0)'
+        required: false
+        default: 'v1.0.0'
 
 permissions:
   contents: write
@@ -57,7 +63,13 @@ jobs:
       - name: Build & Package Targets
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME}"
+          TAG_INPUT="${{ github.event.inputs.tag }}"
+          VERSION="${TAG_INPUT:-${GITHUB_REF_NAME}}"
+          if [ "${VERSION}" = "main" ] || [ -z "${VERSION}" ]; then
+            VERSION="v1.0.0"
+          fi
+          echo "Building release for version: ${VERSION}"
+
           RELEASE_DIR="${RUNNER_TEMP}/release-assets"
           mkdir -p "${RELEASE_DIR}"
 
@@ -69,7 +81,7 @@ jobs:
 
             CGO_ENABLED=0 GOOS=linux GOARCH="${ARCH}" go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o "${BUILD_TMP}/bin/certmate" ./cmd/server
             cp -r opt/acme.sh/* "${BUILD_TMP}/opt/acme.sh/"
-            cp compose.yaml compose.build.yaml Dockerfile .env.example LICENSE README.md "${BUILD_TMP}/"
+            cp compose.yaml compose.build.yaml Dockerfile .env.example LICENSE THIRD_PARTY_NOTICES.md README.md "${BUILD_TMP}/"
             mkdir -p "${BUILD_TMP}/scripts" "${BUILD_TMP}/deploy"
             cp scripts/deploy.sh "${BUILD_TMP}/scripts/"
             cp install.sh install.ps1 "${BUILD_TMP}/"
@@ -91,7 +103,7 @@ jobs:
           echo "==> 生成通用部署配置包..."
           CONFIG_TMP="${RUNNER_TEMP}/config-pkg"
           mkdir -p "${CONFIG_TMP}/scripts" "${CONFIG_TMP}/deploy"
-          cp compose.yaml compose.build.yaml Dockerfile .env.example LICENSE README.md install.sh install.ps1 "${CONFIG_TMP}/"
+          cp compose.yaml compose.build.yaml Dockerfile .env.example LICENSE THIRD_PARTY_NOTICES.md README.md install.sh install.ps1 "${CONFIG_TMP}/"
           cp scripts/deploy.sh "${CONFIG_TMP}/scripts/"
           cp deploy/nginx-certmate.conf "${CONFIG_TMP}/deploy/"
           tar -czf "${RELEASE_DIR}/certmate-deploy.tar.gz" -C "${CONFIG_TMP}" .
@@ -106,6 +118,7 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
             ${{ runner.temp }}/release-assets/*
           generate_release_notes: true
