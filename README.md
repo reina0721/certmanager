@@ -23,34 +23,73 @@ CertMate 不是企业 PKI、密钥托管服务或多租户证书平台。第一�
 
 自签名证书由容器内 OpenSSL 生成，不受浏览器、Outlook、手机邮件客户端或操作系统默认信任，只适合内网、开发和测试。客户端必须自行导入信任，不能用它替代公共 CA 证书。
 
-## 5. Docker Compose 部署
+## 5. Docker 快速部署
 
-Linux 主机只需安装 Git、Bash、Docker Engine 和 Docker Compose v2，然后使用两阶段部署脚本：
+CertMate 支持**利用 GitHub Release 预构建产物部署**：无需在部署机器上安装 Go/Node.js 工具链，**100% 免远程 Docker Pull**（通过离线镜像包 `docker load` 本地导入），**100% 免宿主机现场全量编译**，秒级完成启动。
+
+### 5.1 一条命令安装（推荐）
+
+Linux / macOS 终端交互式安装：
 
 ```bash
-git clone <repo-addr> certmate
+curl -fsSL https://raw.githubusercontent.com/reina0721/certmanager/main/install.sh | bash
+```
+
+中国大陆服务器加速安装（自动启用 GitHub 镜像加速）：
+
+```bash
+curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/reina0721/certmanager/main/install.sh | bash -s -- --mirror cn
+```
+
+Windows（PowerShell 5.1+，配合 Docker Desktop / WSL2）：
+
+```powershell
+irm https://raw.githubusercontent.com/reina0721/certmanager/main/install.ps1 | iex
+```
+
+安装脚本内置友好、安全的**交互向导**：
+- **安装根目录**：默认 `~/certmate`，所有数据与编排文件独立自包含；
+- **Web 访问端口**：默认 `8080`，自动检测宿主机端口冲突；
+- **监听绑定地址**：默认 `127.0.0.1`（推荐配合反向代理）或 `0.0.0.0`；
+- **网络加速策略**：官方源或中国大陆高速节点；
+- **管理员密码**：支持手动设置或自动生成 16 位安全高强度随机密码。
+
+### 5.2 非交互自动化静默部署（CI/脚本）
+
+如需在云服务器初始化脚本或自动化运维工具中一键部署，可传递参数跳过交互：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/reina0721/certmanager/main/install.sh | bash -s -- \
+  --dir /opt/certmate \
+  --port 8080 \
+  --bind 127.0.0.1 \
+  --admin admin \
+  --password 你的安全密码 \
+  --mirror cn \
+  --yes
+```
+
+### 5.3 传统两阶段手动部署
+
+如果你已经克隆了仓库或解压了部署包，也可使用内置脚本：
+
+```bash
 cd certmate
 
-# 第一次只创建 .env 并停止。
+# 第一次只创建 .env 并停止
 bash scripts/deploy.sh init
 
-# 输入管理员密码两次；脚本只保存 bcrypt 哈希。
+# 配置管理员密码（隐藏输入两次，安全保存 bcrypt 哈希）
 bash scripts/deploy.sh configure-admin
 
-# 编辑 .env：确认宿主机数据目录、证书目录和端口。
+# 编辑 .env：确认宿主机数据目录、证书目录和端口
 nano .env
 
-# 第二次自动生成 Session/加密 Secret，构建并启动 Compose。
+# 第二次自动生成 Session/加密 Secret 并启动 Compose
 bash scripts/deploy.sh init
 ```
 
-后续升级使用：
-
-```bash
-bash scripts/deploy.sh update
-```
-
-脚本不会覆盖已有 Secret，不会自动提权；目录权限不足时会打印需要人工确认的 `sudo` 命令。`.env` 的完整中文注释、bcrypt 写法、目录映射、裸 `docker run`、备份和故障处理见 [Docker 部署手册](docs/deployment.md)。
+`.env` 的完整中文注释、bcrypt 写法、目录映射、离线镜像包、备份和故障处理见 [Docker 部署手册](docs/deployment.md)。
 
 本机浏览器默认打开 `http://localhost:8080`。远程生产访问必须放在 HTTPS 反向代理后，不要直接暴露未加密的管理端口。
 
@@ -161,11 +200,12 @@ location ^~ /.well-known/acme-challenge/ {
 ## 15. 升级
 
 ```bash
-# 先按上一节备份
+# 1. 先按上一节备份数据与证书目录
+# 2. 在项目目录下执行平滑更新：
 bash scripts/deploy.sh update
 ```
 
-脚本只接受 fast-forward Git 更新，并拒绝覆盖 tracked 文件修改。应用启动时自动运行向前数据库迁移，并将遗留 `running` 任务标记为 `interrupted`。不要跳过备份，也不要在多个 CertMate 实例间共享同一 SQLite 与证书目录。
+或者使用安装脚本重新指向新版本更新。应用启动时自动运行向前数据库迁移，并将遗留 `running` 任务标记为 `interrupted`。不要跳过备份，也不要在多个 CertMate 实例间共享同一 SQLite 与证书目录。
 
 ## 16. 常见问题
 
@@ -215,20 +255,25 @@ Windows PowerShell 可运行 `./scripts/verify.ps1` 检查 Go、前端构建和�
 ## 19. 项目目录说明
 
 ```text
-cmd/server/                 进程入口与健康检查命令
+cmd/server/                 进程入口与健康检查、哈希与密钥工具子命令
 internal/app/               生命周期与组合根
 internal/auth/              单管理员 Session、重新认证、限流
 internal/certificate/       证书服务、acme.sh/OpenSSL 适配、解析与安全发布
 internal/credential/        DNS Provider 注册表、加密和环境引用
 internal/httpapi/           REST 路由、中间件与协议转换
 internal/scheduler/         动态 Cron 和非重入扫描
+internal/setuphelper/       初始化辅助工具：bcrypt 与随机密钥
 internal/store/sqlite/      SQLite 持久化与迁移执行
 internal/systeminfo/        限时、限输出的运行信息采集
 migrations/                 goose 嵌入式 SQL 迁移
 web/                        React、MUI、TanStack Query、Vitest、Playwright
 deploy/                     反向代理示例
-scripts/                    Linux 部署脚本、隔离测试与 PowerShell 验证入口
+scripts/                    部署脚本、隔离测试与 PowerShell 验证入口
+install.sh / install.ps1    一键向导式在线与离线产物安装入口
 docs/deployment.md          Docker 部署、升级与配置生效手册
 .github/                    CI、Release 和 Dependabot
-Dockerfile / compose.yaml   多阶段镜像与最小权限运行配置
+compose.yaml                生产运行编排 (默认使用本地加载的离线镜像)
+compose.build.yaml          源码本地全量编译编排
+Dockerfile                  轻量运行时镜像打包文件 (无需 Node/Go)
+Dockerfile.source           全量源码构建 Dockerfile
 ```

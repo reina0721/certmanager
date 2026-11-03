@@ -14,17 +14,27 @@ import (
 
 	"github.com/rin721/certmate/internal/app"
 	"github.com/rin721/certmate/internal/config"
+	"github.com/rin721/certmate/internal/setuphelper"
 )
 
 var version = "dev"
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
-		if err := healthcheck(); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "healthcheck":
+			if err := healthcheck(); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			return
+		case "hash-password", "random-secret":
+			if err := setuphelper.Run(os.Args[1:], os.Stdin, os.Stdout); err != nil {
+				fmt.Fprintln(os.Stderr, "初始化工具错误:", err)
+				os.Exit(1)
+			}
+			return
 		}
-		return
 	}
 
 	cfg, err := config.Load()

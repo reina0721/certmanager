@@ -1,17 +1,11 @@
 services:
   certmate:
-    build:
-      context: .
-      args:
-        VERSION: local
-        ACME_SH_VERSION: 3.1.4
-        ACME_SH_SHA256: e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32
-    image: certmate:local
-    container_name: certmate
+    image: "${CERTMATE_IMAGE:-certmate:local}"
+    container_name: "${CERTMATE_CONTAINER_NAME:-certmate}"
     restart: unless-stopped
     user: "${APP_UID:-10001}:${APP_GID:-10001}"
     ports:
-      - "${APP_PORT:-8080}:8080"
+      - "${BIND_ADDRESS:-127.0.0.1}:${APP_PORT:-8080}:8080"
     env_file:
       - .env
     volumes:

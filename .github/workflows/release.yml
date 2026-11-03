@@ -1,29 +1,111 @@
-name: Release image
+name: Release
 
 on:
   push:
     tags: ['v*']
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
-  image:
+  build-and-release:
+    name: Build & Release Artifacts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: docker/setup-qemu-action@v4
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v7
+          go-version: '1.25'
+          cache: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ghcr.io/${{ github.repository }}:${{ github.ref_name }}
-          build-args: VERSION=${{ github.ref_name }}
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: 'web/package-lock.json'
+
+      - name: Build Web Frontend
+        run: |
+          set -euo pipefail
+          cd web
+          npm ci
+          npm run build
+          cd ..
+          ls -la internal/webui/dist
+
+      - name: Download acme.sh
+        run: |
+          set -euo pipefail
+          ACME_SH_VERSION="3.1.4"
+          ACME_SH_SHA256="e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32"
+          mkdir -p /tmp/acmesh opt/acme.sh
+          curl -sSL "https://github.com/acmesh-official/acme.sh/archive/refs/tags/${ACME_SH_VERSION}.tar.gz" -o /tmp/acme.tar.gz
+          echo "${ACME_SH_SHA256}  /tmp/acme.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/acme.tar.gz --strip-components=1 -C opt/acme.sh
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & Package Targets
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          RELEASE_DIR="${RUNNER_TEMP}/release-assets"
+          mkdir -p "${RELEASE_DIR}"
+
+          for ARCH in amd64 arm64; do
+            echo "==> 编译 Go 二进制 (linux/${ARCH})..."
+            BUILD_TMP="${RUNNER_TEMP}/build-${ARCH}"
+            rm -rf "${BUILD_TMP}"
+            mkdir -p "${BUILD_TMP}/bin" "${BUILD_TMP}/opt/acme.sh" "${BUILD_TMP}/deploy"
+
+            CGO_ENABLED=0 GOOS=linux GOARCH="${ARCH}" go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o "${BUILD_TMP}/bin/certmate" ./cmd/server
+            cp -r opt/acme.sh/* "${BUILD_TMP}/opt/acme.sh/"
+            cp compose.yaml compose.build.yaml Dockerfile .env.example LICENSE README.md "${BUILD_TMP}/"
+            mkdir -p "${BUILD_TMP}/scripts" "${BUILD_TMP}/deploy"
+            cp scripts/deploy.sh "${BUILD_TMP}/scripts/"
+            cp install.sh install.ps1 "${BUILD_TMP}/"
+            cp deploy/nginx-certmate.conf "${BUILD_TMP}/deploy/"
+
+            echo "==> 构建 Docker 镜像并导出离线包 (linux/${ARCH})..."
+            IMAGE_TAG="certmate:local"
+            DOCKER_ARCH="${ARCH}"
+            if [ "${ARCH}" = "arm64" ]; then
+              DOCKER_ARCH="arm64/v8"
+            fi
+            docker build --platform "linux/${DOCKER_ARCH}" -t "${IMAGE_TAG}" -t "certmate:${VERSION}" "${BUILD_TMP}"
+            docker save "${IMAGE_TAG}" "certmate:${VERSION}" | gzip -9 > "${RELEASE_DIR}/certmate-image-linux-${ARCH}.tar.gz"
+
+            echo "==> 打包运行产物包 (linux/${ARCH})..."
+            tar -czf "${RELEASE_DIR}/certmate-bundle-linux-${ARCH}.tar.gz" -C "${BUILD_TMP}" .
+          done
+
+          echo "==> 生成通用部署配置包..."
+          CONFIG_TMP="${RUNNER_TEMP}/config-pkg"
+          mkdir -p "${CONFIG_TMP}/scripts" "${CONFIG_TMP}/deploy"
+          cp compose.yaml compose.build.yaml Dockerfile .env.example LICENSE README.md install.sh install.ps1 "${CONFIG_TMP}/"
+          cp scripts/deploy.sh "${CONFIG_TMP}/scripts/"
+          cp deploy/nginx-certmate.conf "${CONFIG_TMP}/deploy/"
+          tar -czf "${RELEASE_DIR}/certmate-deploy.tar.gz" -C "${CONFIG_TMP}" .
+          zip -r -q "${RELEASE_DIR}/certmate-deploy.zip" -j "${CONFIG_TMP}"/*
+
+          echo "==> 生成 SHA256SUMS..."
+          cd "${RELEASE_DIR}"
+          sha256sum certmate-* > SHA256SUMS
+          cat SHA256SUMS
+          cd "${GITHUB_WORKSPACE}"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ runner.temp }}/release-assets/*
+          generate_release_notes: true

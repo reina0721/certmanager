@@ -45,8 +45,9 @@ usage() {
 CertMate Docker Compose 部署脚本
 
 用法：
-  bash scripts/deploy.sh init    初始化配置或按现有配置构建并启动服务
-  bash scripts/deploy.sh update  执行 git pull --ff-only 后构建并更新服务
+  bash scripts/deploy.sh init [--from-source]
+                                 初始化配置或按现有镜像/产物启动服务
+  bash scripts/deploy.sh update  更新服务 (Git 模式下拉取最新代码，产物模式下重载容器)
   bash scripts/deploy.sh configure-admin [用户名]
                                  交互输入密码并保存 bcrypt 哈希
   bash scripts/deploy.sh help    显示帮助
@@ -208,7 +209,6 @@ configure_admin_credentials() {
     fi
     [[ "${username}" =~ ^[A-Za-z0-9._@-]{1,64}$ ]] || die "管理员用户名只能包含字母、数字、点、下划线、@ 和连字符，长度为 1-64。"
 
-    build_setup_helper
     [[ "${-}" != *x* ]] || set +x
     printf '管理员密码（输入内容不会显示）：' >&2
     if ! IFS= read -r -s password; then
@@ -235,7 +235,7 @@ configure_admin_credentials() {
         die "管理员密码哈希生成失败。"
     fi
     unset password password_confirmation
-    [[ "${password_hash}" =~ ^\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}$ ]] || die "Docker 初始化工具未返回有效的 bcrypt 哈希。"
+    [[ "${password_hash}" =~ ^\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}$ ]] || die "初始化工具未返回有效的 bcrypt 哈希。"
 
     write_admin_credentials "${username}" "${password_hash}"
     log "已保存管理员 ${username} 的 bcrypt 哈希，并清空其他管理员密码来源。"
@@ -253,26 +253,46 @@ ensure_admin_config() {
     configure_admin_credentials
 }
 
-build_setup_helper() {
-    if [[ "${SETUP_HELPER_READY}" == true ]]; then
-        return
-    fi
-    require_command docker
-    log "构建一次性 Docker 初始化工具（宿主机无需安装 Apache 或 OpenSSL）。"
-    docker build --target setup-helper --tag "${SETUP_HELPER_IMAGE}" "${PROJECT_ROOT}" || die "构建 Docker 初始化工具失败。"
-    SETUP_HELPER_READY=true
-}
-
 run_setup_helper() {
     local operation=$1
-    build_setup_helper
-    docker run --rm -i --network none --read-only --security-opt no-new-privileges:true --cap-drop ALL "${SETUP_HELPER_IMAGE}" "${operation}"
+    local image_name
+    image_name="$(env_value CERTMATE_IMAGE certmate:local)"
+
+    # 优先方式 1：利用已导入或已构建的 CertMate 镜像（无需额外 build）
+    if docker image inspect "${image_name}" >/dev/null 2>&1; then
+        docker run --rm -i --network none --security-opt no-new-privileges:true --cap-drop ALL "${image_name}" "${operation}"
+        return
+    fi
+
+    # 优先方式 2：本地预编译二进制
+    if [[ -x "${PROJECT_ROOT}/bin/certmate" ]]; then
+        "${PROJECT_ROOT}/bin/certmate" "${operation}"
+        return
+    fi
+
+    # 方式 3：如果存在 Dockerfile.source，现场编译最小 helper
+    if [[ -f "${PROJECT_ROOT}/Dockerfile.source" ]]; then
+        if [[ "${SETUP_HELPER_READY}" != true ]]; then
+            require_command docker
+            log "构建一次性 Docker 初始化工具..."
+            docker build --file "${PROJECT_ROOT}/Dockerfile.source" --target setup-helper --tag "${SETUP_HELPER_IMAGE}" "${PROJECT_ROOT}" || die "构建初始化工具失败。"
+            SETUP_HELPER_READY=true
+        fi
+        docker run --rm -i --network none --read-only --security-opt no-new-privileges:true --cap-drop ALL "${SETUP_HELPER_IMAGE}" "${operation}"
+        return
+    fi
+
+    die "无法找到生成 ${operation} 的工具（镜像 ${image_name} 或 bin/certmate 未就绪）。"
 }
 
 generate_secret() {
     local secret
-    secret="$(run_setup_helper random-secret)" || die "生成随机 Secret 失败。"
-    [[ "${secret}" =~ ^[0-9a-f]{64}$ ]] || die "Docker 初始化工具未返回预期的 32 字节随机值。"
+    if command -v openssl >/dev/null 2>&1; then
+        secret="$(openssl rand -hex 32)"
+    else
+        secret="$(run_setup_helper random-secret)" || die "生成随机 Secret 失败。"
+    fi
+    [[ "${secret}" =~ ^[0-9a-f]{64}$ ]] || die "初始化工具未返回预期的 32 字节随机值。"
     printf '%s' "${secret}"
 }
 
@@ -284,7 +304,6 @@ ensure_secret() {
         return
     fi
 
-    build_setup_helper
     generated_secret="$(generate_secret)"
     if [[ "${value_key}" == "APP_ENCRYPTION_KEY" && "${generated_secret}" == "$(env_value SESSION_SECRET)" ]]; then
         generated_secret="$(generate_secret)"
@@ -443,11 +462,9 @@ show_compose_start_help() {
 可先查看占用该端口的 Docker 容器：
   docker ps --filter publish=${app_port} --format 'table {{.Names}}\t{{.Ports}}'
 
-若该端口应由其他服务使用，请在 .env 中只修改 APP_PORT，例如：
+若该端口应由其他服务使用，请在 .env 中修改 APP_PORT，例如：
   APP_PORT=8081
-  LISTEN_ADDR=:8080
 
-APP_PORT 是宿主机访问端口；Compose 下 LISTEN_ADDR 必须保持容器内的 :8080。
 修改后重新运行：bash scripts/deploy.sh init
 EOF
 
@@ -485,14 +502,35 @@ wait_for_health() {
 }
 
 deploy_compose() {
+    local from_source=${1:-0}
+    local image_name
     require_command docker
     docker compose version >/dev/null 2>&1 || die "需要 Docker Compose v2（docker compose）。"
     cd -- "${PROJECT_ROOT}"
+
     log "校验 Docker Compose 配置。"
     docker compose --env-file "${ENV_FILE}" config --quiet || die "Docker Compose 配置校验失败。"
-    log "构建 CertMate 镜像。"
-    docker compose --env-file "${ENV_FILE}" build --pull || die "Docker Compose 构建失败。"
-    log "创建或更新 CertMate 服务。"
+
+    image_name="$(env_value CERTMATE_IMAGE certmate:local)"
+
+    # 源码构建分支
+    if [[ "${from_source}" -eq 1 ]]; then
+        [[ -f "${PROJECT_ROOT}/compose.build.yaml" && -f "${PROJECT_ROOT}/Dockerfile.source" ]] || die "缺少源码构建文件 compose.build.yaml 或 Dockerfile.source。"
+        log "从源码构建 CertMate 镜像..."
+        docker compose --env-file "${ENV_FILE}" -f compose.yaml -f compose.build.yaml build || die "源码构建失败。"
+    else
+        # 预构建产物分支：检查镜像是否存在
+        if ! docker image inspect "${image_name}" >/dev/null 2>&1; then
+            if [[ -f "${PROJECT_ROOT}/Dockerfile" && -x "${PROJECT_ROOT}/bin/certmate" ]]; then
+                log "镜像 ${image_name} 尚未就绪，检测到预构建产物 bin/certmate，执行轻量快速打包 (3秒)..."
+                docker build -t "${image_name}" "${PROJECT_ROOT}" || die "轻量运行时打包失败。"
+            else
+                die "未找到 Docker 镜像 ${image_name}。请先使用 install.sh 导入镜像包，或传入 --from-source 从源码构建。"
+            fi
+        fi
+    fi
+
+    log "创建或更新 CertMate 服务..."
     if ! docker compose --env-file "${ENV_FILE}" up -d --force-recreate; then
         show_service_logs
         show_compose_start_help
@@ -504,6 +542,11 @@ deploy_compose() {
 }
 
 initialize() {
+    local from_source=0
+    if [[ "${1:-}" == "--from-source" ]]; then
+        from_source=1
+    fi
+
     [[ -f "${ENV_EXAMPLE_FILE}" && ! -L "${ENV_EXAMPLE_FILE}" ]] || die "找不到普通配置模板 ${ENV_EXAMPLE_FILE}。"
     [[ ! -L "${ENV_FILE}" ]] || die ".env 不能是符号链接。"
     if [[ ! -e "${ENV_FILE}" ]]; then
@@ -544,21 +587,26 @@ EOF
     ensure_secret SESSION_SECRET SESSION_SECRET_FILE
     ensure_secret APP_ENCRYPTION_KEY APP_ENCRYPTION_KEY_FILE
     validate_secret_config
-    deploy_compose
+    deploy_compose "${from_source}"
 }
 
 update() {
     [[ -f "${ENV_FILE}" && ! -L "${ENV_FILE}" ]] || die "update 要求已有普通 .env；请先运行 init 并完成配置。"
-    require_command git
     require_command realpath
     cd -- "${PROJECT_ROOT}"
-    local repository_root
-    repository_root="$(git rev-parse --show-toplevel 2>/dev/null)" || die "当前目录不是 Git 工作树。"
-    [[ "$(realpath -m -- "${repository_root}")" == "${PROJECT_ROOT}" ]] || die "脚本所在目录不是当前 Git 工作树根目录。"
-    git diff --quiet -- || die "存在未提交的 tracked 文件修改，拒绝自动更新。"
-    git diff --cached --quiet -- || die "存在已暂存但未提交的修改，拒绝自动更新。"
-    log "执行 fast-forward 更新。"
-    git pull --ff-only || die "git pull --ff-only 失败，未继续部署。"
+
+    if git rev-parse --show-toplevel >/dev/null 2>&1; then
+        local repository_root
+        repository_root="$(git rev-parse --show-toplevel)"
+        if [[ "$(realpath -m -- "${repository_root}")" == "${PROJECT_ROOT}" ]]; then
+            git diff --quiet -- || die "存在未提交的 tracked 文件修改，拒绝自动更新。"
+            git diff --cached --quiet -- || die "存在已暂存但未提交的修改，拒绝自动更新。"
+            log "执行 fast-forward 更新代码..."
+            git pull --ff-only || die "git pull --ff-only 失败，未继续部署。"
+        fi
+    fi
+
+    log "重新载入服务配置并重启容器..."
     exec "${BASH}" "${SCRIPT_DIR}/deploy.sh" init
 }
 
@@ -572,8 +620,8 @@ configure_admin() {
     configure_admin_credentials "${1:-}"
     cat <<'EOF'
 
-密码哈希使用的 helper 是一次性容器，已通过 --rm 自动删除；这是正常行为。
-请确认 .env 中的 DATA_HOST_DIR、CERTS_HOST_DIR 和 APP_PORT，然后启动常驻服务：
+密码哈希已安全更新。
+请确认 .env 配置，然后启动服务：
   bash scripts/deploy.sh init
 
 启动后查看：
@@ -585,7 +633,8 @@ EOF
 main() {
     case "${1:-help}" in
         init)
-            initialize
+            shift
+            initialize "$@"
             ;;
         update)
             update

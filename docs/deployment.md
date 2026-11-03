@@ -1,322 +1,201 @@
 # CertMate Docker 部署手册
 
-本文是 CertMate Docker 部署与升级的权威说明。推荐方式是 Linux 主机上的两阶段部署脚本加 Docker Compose；业务使用说明请回到 [README.md](../README.md)。
+本文是 CertMate Docker 部署与升级的权威说明。推荐方式是基于 GitHub Release 预构建产物的交互式安装向导与 Docker Compose 部署；业务使用说明请回到 [README.md](../README.md)。
 
-## 1. 部署前提
+## 1. 部署前提与核心架构
 
 部署主机需要：
 
-- Linux；
-- Git；
-- Bash；
-- Docker Engine；
+- Linux（或支持 WSL2/Docker Desktop 的 Windows）；
+- Bash（Windows 下使用 PowerShell 5.1+）；
+- Docker Engine 20.10+；
 - Docker Compose v2，即 `docker compose` 命令。
 
-CertMate 只运行一个常驻应用容器，不使用 Docker Socket。bcrypt、随机 Secret 和证书所需工具都在项目自己的 Docker 镜像中，宿主机不需要安装 Apache、`htpasswd`、OpenSSL、Go 或 Node.js。SQLite、acme.sh 状态和证书分别持久化到宿主机目录。
+### 为什么选择预构建产物部署？
+在生产环境或配置受限的服务器上现场全量构建（前端 Vite + npm ci + Go 编译）极易因网络超时、内网隔离或内存不足（OOM）导致失败；同时在中国大陆服务器直接 `docker pull` 海外 Registry 也经常受限。
 
-## 2. 首次部署
+CertMate 采用与 `dsh-docker` 一致的现代化发布架构：
+1. **CI 负责重活**：GitHub Actions 在云端完成前端 Vite 静态产物构建与 Go 单静态二进制交叉编译，并直接制作离线 Docker 镜像包 `certmate-image-${arch}.tar.gz`；
+2. **直链加速下载**：用户利用 Git / GitHub Release 资产下载预打包文件，提供中国大陆镜像节点（如 `ghfast.top` 等）加速下载；
+3. **100% 免远程 Docker Pull**：安装脚本直接执行 `docker load -i certmate-image-${arch}.tar.gz` 载入本地镜像 `certmate:local`，全程不连接任何 Docker Registry；
+4. **100% 免本地依赖编译**：宿主机不需要安装 Node.js、npm、Go、OpenSSL 或任何开发依赖，启动时间仅需几秒钟。
 
-### 2.1 Clone 仓库
+---
 
+## 2. 推荐：一键向导部署
+
+### 2.1 Linux / macOS 在线安装
+
+官方源直接安装：
 ```bash
-git clone <repo-addr> certmate
-cd certmate
+curl -fsSL https://raw.githubusercontent.com/reina0721/certmanager/main/install.sh | bash
 ```
 
-部署脚本位于仓库内，因此首次 clone 仍由用户执行，不使用不透明的远程 `curl | sh` 安装方式。
+中国大陆服务器加速安装（脚本与 Release 产物均优先通过加速通道下载）：
+```bash
+curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/reina0721/certmanager/main/install.sh | bash -s -- --mirror cn
+```
 
-### 2.2 第一次运行：只创建 `.env`
+### 2.2 Windows 原生 PowerShell 安装
+
+```powershell
+irm https://raw.githubusercontent.com/reina0721/certmanager/main/install.ps1 | iex
+```
+
+### 2.3 交互式向导说明
+
+运行安装脚本后，终端将引导您完成关键选项配置：
+1. **安装根目录**：默认 `~/certmate`。所有编排文件、配置（`.env`）、持久化数据（`data/`）及证书（`certs/`）完全存放在该目录下，不向系统散落文件；
+2. **Web 端口**：默认 `8080`。脚本会自动检查端口占用，发现冲突时提示更换；
+3. **监听绑定地址**：默认 `127.0.0.1`（适合宿主机通过 Nginx/Caddy 等前端反代终止 TLS）；若设为 `0.0.0.0` 则允许局域网或公网直接访问；
+4. **网络镜像策略**：可选 `global`（官方）或 `cn`（国内加速镜像）；
+5. **管理员账户与密码**：可输入自定义密码（默认要求 >=12 位，加 `--weak-password` 允许 >=6 位），或直接回车由脚本自动生成 16 位高强度安全密码。
+
+---
+
+## 3. 非交互自动化静默部署（CI / 脚本运维）
+
+如果要在云主机初始化、Ansible、Terraform 或自动化 Shell 中一键部署，可传递参数跳过交互：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/reina0721/certmanager/main/install.sh | bash -s -- \
+  --dir /opt/certmate \
+  --port 8080 \
+  --bind 127.0.0.1 \
+  --admin admin \
+  --password 'MySuperSecretP@ss123' \
+  --mirror cn \
+  --yes
+```
+
+### 常用参数说明
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--dir <PATH>` | `~/certmate` | 项目安装根目录 |
+| `--port <PORT>` | `8080` | 宿主机 Web 访问端口 |
+| `--bind <IP>` | `127.0.0.1` | 绑定监听 IP（`127.0.0.1` 本机反代 或 `0.0.0.0` 全网访问） |
+| `--admin <USER>` | `admin` | 管理员用户名 |
+| `--password <PASS>`| 自动生成 | 管理员登录密码（留空自动生成 16 位安全密码） |
+| `--weak-password` | 强密码模式 | 允许使用简短测试密码（>=6位） |
+| `--mirror <global\|cn>`| `global` | 网络加速策略，`cn` 会使用国内加速节点 |
+| `--version <VER>` | `latest` | 指定 Release 版本标签（如 `v1.0.0`） |
+| `--no-deploy` | 立即启动 | 仅完成产物下载、解压与 `.env` 生成，不立即执行 Docker 启动 |
+| `--yes`, `-y` | 交互向导 | 非交互静默确认，未指定项自动采用默认值 |
+| `--from-source` | 否 | 从当前环境源码重新构建 |
+
+---
+
+## 4. 手动部署与两阶段配置模式
+
+如果因内网隔离手工拷贝了 Release 部署包（`certmate-bundle-*.tar.gz` 与 `certmate-image-*.tar.gz`）：
+
+### 4.1 解压与导入镜像
+
+```bash
+mkdir -p ~/certmate && cd ~/certmate
+tar -xzf certmate-bundle-linux-amd64.tar.gz
+docker load -i certmate-image-linux-amd64.tar.gz
+```
+
+### 4.2 第一步：生成 `.env`
 
 ```bash
 bash scripts/deploy.sh init
 ```
 
-当 `.env` 不存在时，脚本只执行以下操作：
+当 `.env` 不存在时，脚本只复制 `.env.example` 为 `.env` 并将其设为 `0600`，提示人工确认后退出。
 
-1. 复制 `.env.example` 为 `.env`；
-2. 将 `.env` 权限设为 `0600`；
-3. 显示必须配置的字段；
-4. 以成功状态停止，不生成 Secret，也不调用 Docker。
-
-先通过脚本配置管理员账户。脚本会询问用户名，并隐藏输入、确认两次密码；密码不会进入 Shell 历史：
+### 4.3 配置管理员账户
 
 ```bash
 bash scripts/deploy.sh configure-admin
 ```
 
-脚本会构建项目内的最小 helper 镜像，通过 stdin 将密码交给无网络、只读、无 Linux capabilities 的临时容器生成 bcrypt。临时容器带有 `--rm`，完成后会自动删除，因此不会出现在随后执行的 `docker ps` 中。最终只把单引号保护的哈希写入 `ADMIN_PASSWORD_HASH`，并清空其他管理员密码来源；明文密码不会写入 `.env`、命令行或日志。
-
-然后编辑其余配置：
-
-```bash
-nano .env
-```
-
-至少确认以下内容：
-
-```env
-# 默认映射到项目根目录下的相对目录。
-DATA_HOST_DIR=./data
-CERTS_HOST_DIR=./certs
-
-# 容器使用的宿主机 UID/GID，默认保持 10001。
-APP_UID=10001
-APP_GID=10001
-
-# 这两个值保持为空，第二次运行由脚本自动生成。
-SESSION_SECRET=
-APP_ENCRYPTION_KEY=
-```
-
-`DATA_HOST_DIR` 保存 SQLite、acme.sh 状态、任务临时文件和备份；`CERTS_HOST_DIR` 保存对外使用的证书文件。它们必须是彼此独立的目录。
-
-### 2.3 管理员账户与密码轮换
-
-如果没有单独运行 `configure-admin`，第二次在交互终端运行 `init` 时也会检测到管理员密码缺失，并进入相同的用户名和密码配置流程。
-
-以后轮换管理员用户名或密码仍使用：
-
-```bash
-bash scripts/deploy.sh configure-admin
-bash scripts/deploy.sh init
-```
-
-生成后的配置形式为：
+脚本会隐藏输入两次密码，并通过已导入的 Docker 镜像安全计算 bcrypt 哈希后写入 `.env`：
 
 ```env
 ADMIN_PASSWORD_HASH='$2y$12$...'
 ADMIN_PASSWORD=
 ```
 
-bcrypt 包含 `$`，因此脚本会自动使用单引号保护。手工修改时如果漏掉单引号，Docker Compose 会进行变量插值，部署脚本会拒绝继续。
+### 4.4 第二步：生成 Secret 并启动
 
-应用选择管理员密码的优先级固定为：
-
-1. `ADMIN_PASSWORD_HASH_FILE`；
-2. `ADMIN_PASSWORD_HASH`；
-3. `ADMIN_PASSWORD_FILE`；
-4. `ADMIN_PASSWORD`。
-
-配置多项时高优先级项生效，脚本会给出警告。管理员账户不会写入 SQLite。
-
-### 2.4 第二次运行：生成 Secret 并启动
-
-保存 `.env` 后再次执行相同命令：
+再次运行：
 
 ```bash
 bash scripts/deploy.sh init
 ```
 
-这次脚本会：
+脚本会自动生成 32 字节高强度 `SESSION_SECRET` 与 `APP_ENCRYPTION_KEY`，校验目录权限后启动容器并等待健康检查就绪。
 
-1. 安全读取 `.env`，不通过 `source` 执行其中的内容；
-2. 检查重复配置键、管理员账户、端口、UID/GID 和宿主机路径；
-3. 使用一次性 Docker helper 中的 Go `crypto/rand` 生成不同的 `SESSION_SECRET` 和 `APP_ENCRYPTION_KEY`；
-4. 原子写回 `.env`，不在终端显示 Secret；
-5. 创建并验证宿主机持久化目录；
-6. 执行 Compose 配置校验、镜像构建和容器更新；
-7. 最多等待 120 秒，直到容器健康。
+---
 
-脚本实际使用的 Compose 流程为：
+## 5. 源码本地自构建模式（高级开发者）
+
+如果需要修改前端或后端源码并在本地重新全量编译：
 
 ```bash
-docker compose --env-file .env config --quiet
-docker compose --env-file .env build --pull
-docker compose --env-file .env up -d --force-recreate
+# 结合 compose.build.yaml 使用本地 Dockerfile.source 编译
+docker compose -f compose.yaml -f compose.build.yaml build
+
+# 或通过脚本指定源码模式
+bash scripts/deploy.sh init --from-source
 ```
 
-Secret 只在对应内联值和 `*_FILE` 引用都为空时生成。以后重复运行 `init` 或执行升级都保留原值。
+源码构建会启动多阶段 Docker 编译：下载 Node 镜像、运行 `npm ci` 和 `npm run build`、下载 Go 编译器构建二进制、以及下载校验 `acme.sh`。这需要主机具备充足的内存与顺畅的互联网连接。
 
-### 2.5 目录权限不足
+---
 
-容器默认以 `10001:10001` 运行。脚本不会自动调用 `sudo`；如果目录无法创建，或所有者、写入权限与 `APP_UID`/`APP_GID` 不一致，脚本会停止并输出包含实际路径的命令，例如：
+## 6. 配置项详解（`.env`）
 
-```bash
-sudo mkdir -p -- "$PWD/data" "$PWD/certs"
-sudo chown -R -- 10001:10001 "$PWD/data" "$PWD/certs"
-sudo chmod u+rwx -- "$PWD/data" "$PWD/certs"
-```
+| 配置 | 填写方式 | 说明 |
+| --- | --- | --- |
+| `ADMIN_USERNAME` | 用户指定 | 单管理员登录名 |
+| `ADMIN_PASSWORD_HASH` | 脚本生成/单引号 | 管理员 bcrypt 哈希，含 `$` 时必须使用单引号包围 |
+| `SESSION_SECRET` | 脚本自动生成 | 32 字节十六进制会话加密密钥 |
+| `APP_ENCRYPTION_KEY` | 脚本自动生成 | 32 字节十六进制 DNS 凭据加密密钥 |
+| `APP_PORT` | 用户指定 | 宿主机 Web 映射端口（容器内固定为 8080） |
+| `BIND_ADDRESS` | 用户指定 | 宿主机监听地址（`127.0.0.1` 或 `0.0.0.0`） |
+| `DATA_HOST_DIR` | 用户指定 | 宿主机数据持久化目录（存放 SQLite 与 ACME 状态） |
+| `CERTS_HOST_DIR` | 用户指定 | 宿主机生产证书输出目录 |
+| `APP_UID` / `APP_GID` | 用户指定 | 容器进程与文件所有者（默认 `10001:10001`） |
+| `CERTMATE_IMAGE` | 产物预设 | Docker 镜像标签，产物部署默认为 `certmate:local` |
+| `SESSION_COOKIE_SECURE` | 用户确认 | 生产环境必须保持 `true`（要求 HTTPS） |
 
-检查路径无误后执行提示命令，再重新运行：
+修改 `.env` 后重新执行 `bash scripts/deploy.sh init` 即可使配置生效。
 
-```bash
-bash scripts/deploy.sh init
-```
+---
 
-脚本拒绝 `/`、`/etc`、`/usr`、仓库根目录等过于宽泛的目标，也拒绝目录重叠和最终路径为符号链接的配置。
+## 7. 更新与升级维护
 
-## 3. 从 Git 更新部署
+### 7.1 升级前备份
 
-升级前备份 `.env`、数据目录和证书目录，然后在仓库根目录执行：
+在执行升级前，请妥善备份以下内容：
+1. `.env` 配置文件；
+2. `DATA_HOST_DIR`（默认 `./data`，包含 SQLite 数据库与 ACME 账号状态）；
+3. `CERTS_HOST_DIR`（默认 `./certs`，生产证书目录）。
 
+### 7.2 执行平滑更新
+
+如果在 Git 工作目录下部署：
 ```bash
 bash scripts/deploy.sh update
 ```
+脚本会执行 `git pull --ff-only` 并平滑重启服务。
 
-`update` 要求：
+如果使用预构建产物部署：
+重新执行 `install.sh` 脚本并指定新版本标签，脚本会自动下载新版产物并重新导入镜像平滑替换容器。应用启动时会自动执行 SQLite 向前数据库迁移。
 
-- 已存在完成配置的 `.env`；
-- 当前脚本位于 Git 工作树根目录；
-- tracked 文件没有未提交或已暂存的修改。
+---
 
-满足条件后，脚本执行 `git pull --ff-only`，再使用更新后的脚本复用完整 `init` 部署流程。Git 拉取失败时不会继续构建或更新容器。
+## 8. 常见问题排查
 
-脚本不会运行 `git reset`、不会覆盖本地修改、不会删除 Volume，也不会执行 `docker compose down -v`。
-
-## 4. `.env` 与环境变量的关系
-
-Compose 推荐部署只维护仓库根目录的一份 `.env`：
-
-- Compose 使用它解析 `APP_PORT`、`DATA_HOST_DIR`、`CERTS_HOST_DIR`、`APP_UID` 和 `APP_GID`；
-- `compose.yaml` 的 `env_file: .env` 再把应用运行配置传入容器；
-- 修改 `.env` 后必须重新执行 `bash scripts/deploy.sh init`，单独 `docker compose restart` 不会可靠地更新容器环境。
-
-不要在日常部署命令上重复写 `-e SESSION_SECRET=...`。这会让配置来源分散，也容易在 Shell 历史、进程参数或自动化日志中暴露 Secret。
-
-关键字段如下：
-
-| 配置 | 谁来填写 | 说明 |
-| --- | --- | --- |
-| `ADMIN_USERNAME` | 用户 | 单管理员登录名，不能为空 |
-| 四种 `ADMIN_PASSWORD*` | 用户 | 至少配置一种，推荐 bcrypt 哈希或只读 Secret 文件 |
-| `SESSION_SECRET` | 脚本 | 会话签名密钥，首次生成后长期复用 |
-| `APP_ENCRYPTION_KEY` | 脚本 | DNS 凭据加密密钥，首次生成后长期复用 |
-| `APP_PORT` | 用户 | 宿主机端口，容器内仍为 `8080` |
-| `DATA_HOST_DIR` | 用户 | 宿主机应用数据目录，映射到 `/data` |
-| `CERTS_HOST_DIR` | 用户 | 宿主机证书目录，映射到 `/certs` |
-| `APP_UID` / `APP_GID` | 用户 | 容器进程及持久化目录所有者，默认 `10001:10001` |
-| `DEFAULT_CA` | 用户可选 | CA 预设或不含凭据、片段的 HTTPS Directory URL |
-| `DEFAULT_ACME_EMAIL` | 用户可选 | ACME 账户邮箱 |
-| `SESSION_COOKIE_SECURE` | 用户 | HTTPS 生产环境保持 `true` |
-
-`.env.example` 包含其余字段及逐项中文注释。容器内 `DATA_DIR=/data` 和 `CERT_OUTPUT_DIR=/certs` 必须保持不变；自定义宿主机路径只修改 `*_HOST_DIR`。
-
-如果宿主机 `8080` 已被 Nginx、邮件服务或其他容器占用，只修改宿主机映射端口；不要修改容器监听端口。例如：
-
-```env
-APP_PORT=8081
-LISTEN_ADDR=:8080
-```
-
-此时访问地址为 `http://<服务器地址>:8081`，Compose 仍会把请求转发到容器内 `8080`。
-
-修改 `SESSION_SECRET` 会让已有登录会话失效。修改 `APP_ENCRYPTION_KEY` 可能导致数据库中已有 DNS 凭据无法解密，修改前必须备份数据。
-
-### 4.1 使用只读 Secret 文件
-
-高级部署可以设置 `ADMIN_PASSWORD_HASH_FILE`、`SESSION_SECRET_FILE` 和 `APP_ENCRYPTION_KEY_FILE`。这些值填写容器内路径，例如 `/run/secrets/session_secret`，并通过单独的 Compose override 或平台 Secret 配置将宿主机文件只读挂载进去。
-
-一旦设置对应 `*_FILE`，脚本不会生成内联值。默认 `compose.yaml` 不猜测宿主机 Secret 文件位置，因此不会自动增加这些挂载。
-
-## 5. 自定义证书输出目录
-
-默认配置使用项目根目录下的相对目录：
-
-```env
-CERTS_HOST_DIR=./certs
-```
-
-Compose 始终挂载为：
-
-```text
-<项目根目录>/certs:/certs
-```
-
-假设证书安全目录名为 `example-com`，宿主机文件为：
-
-```text
-./certs/example-com/cert.pem
-./certs/example-com/chain.pem
-./certs/example-com/fullchain.pem
-./certs/example-com/privkey.pem
-./certs/example-com/metadata.json
-./certs/example-com/.renewed
-```
-
-其他业务容器只读挂载宿主机目录，不要挂载 CertMate 的 `/data/acme` 内部目录：
-
-```yaml
-services:
-  nginx:
-    volumes:
-      - ./certs:/etc/nginx/certs:ro
-```
-
-## 6. 配置生效边界
-
-以下配置在创建容器时读取，修改后重新运行部署脚本：
-
-- 端口和宿主机目录；
-- 管理员账户；
-- Session 与应用加密密钥；
-- ACME、自签名、可信代理和日志开关；
-- OpenSSL 与 acme.sh 路径。
-
-管理后台中的续签 Cron、时区、最大并发、重试策略、单证书续签选项和 DNS 凭据保存后会动态生效，不需要重启容器。
-
-## 7. 裸 `docker build` / `docker run`（高级）
-
-推荐脚本只管理 Compose。如果环境必须使用裸 Docker，可以复用已经初始化完成的 `.env`：
-
-```bash
-docker build --build-arg VERSION=local -t certmate:local .
-
-docker run -d \
-  --name certmate \
-  --restart unless-stopped \
-  --user 10001:10001 \
-  --env-file ./.env \
-  -p 8080:8080 \
-  -v "$(pwd)/data:/data" \
-  -v "$(pwd)/certs:/certs" \
-  --read-only \
-  --tmpfs /tmp:size=64m,mode=1770,uid=10001,gid=10001 \
-  --security-opt no-new-privileges:true \
-  --cap-drop ALL \
-  certmate:local
-```
-
-裸 `docker run` 不读取 Compose 的 `DATA_HOST_DIR`、`CERTS_HOST_DIR` 和 `APP_PORT` 映射语义，必须在 `-p`、`-v` 和 `--user` 参数中显式使用相同值。不要通过 `--build-arg` 传递运行时 Secret。
-
-## 8. 备份、停止与排查
-
-升级前应同时备份：
-
-- `.env` 或外部 Secret；
-- `DATA_HOST_DIR`；
-- `CERTS_HOST_DIR`。
-
-常用只读或可恢复操作：
-
-```bash
-docker compose ps
-docker compose logs --tail=200 certmate
-docker compose stop certmate
-docker compose start certmate
-```
-
-应用启动时会执行向前数据库迁移，并将遗留的 `running` 任务标记为 `interrupted`。不要让多个 CertMate 实例共享同一 SQLite 与证书目录。
-
-## 9. 验收清单
-
-- `bash scripts/deploy.sh init` 最终报告健康；
-- `docker compose ps` 显示 `certmate` 为 healthy；
-- 浏览器能够通过预期地址打开页面并使用自定义管理员账户登录；
-- 重启容器后 SQLite、acme.sh 状态和证书仍存在；
-- `CERTS_HOST_DIR` 中能够看到签发后的证书文件；
-- 其他容器只读挂载证书目录；
-- `.env` 权限为 `0600` 且未提交到 Git；
-- 容器未挂载 Docker Socket，未获得 root 或额外 capabilities；
-- 生产环境通过 HTTPS 反向代理访问并保持 `SESSION_COOKIE_SECURE=true`。
-
-更多安全边界与报告方式见 [SECURITY.md](../SECURITY.md)。
-
-## 10. 常见问题
-
-- **第一次运行没有启动 Docker**：这是正常的两阶段流程。先编辑新生成的 `.env`，然后再次运行 `bash scripts/deploy.sh init`。
-- **提示目录权限不匹配**：检查脚本打印的路径后执行其 `sudo mkdir/chown/chmod` 命令，再重新运行。
-- **提示 bcrypt 必须加单引号**：把配置写成 `ADMIN_PASSWORD_HASH='$2y$...'`。
-- **登录后仍返回登录页**：生产 Secure Cookie 需要 HTTPS。本机隔离试用可临时设置 `SESSION_COOKIE_SECURE=false`。
-- **提示 `port is already allocated`**：宿主机 `APP_PORT` 已被占用。运行 `docker ps --filter publish=<端口>` 查看 Docker 占用者，或在 `.env` 中将 `APP_PORT` 改为未占用端口；`LISTEN_ADDR` 必须保持 `:8080`。修改后重新运行部署脚本，失败后处于 `Created` 状态的容器会被重新创建。
-- **更新被拒绝**：先查看 `git status` 并妥善处理 tracked 文件修改；脚本不会自动覆盖或清理它们。
-- **容器启动失败**：运行 `docker compose logs --tail=200 certmate`；不要把包含 Secret 的 `.env` 内容粘贴到公开问题中。
+1. **宿主机端口已被占用 (`port is already allocated`)**：
+   修改 `.env` 中的 `APP_PORT`（例如改为 `8081`），然后重新运行 `bash scripts/deploy.sh init`。不要修改容器内部的 `LISTEN_ADDR`。
+2. **目录权限错误 (`permission denied`)**：
+   宿主机挂载目录（`./data` 和 `./certs`）的所有者必须与 `APP_UID:APP_GID`（默认 `10001:10001`）匹配。部署脚本在检测到权限不匹配时会给出具体的 `sudo chown -R 10001:10001 ...` 修复命令。
+3. **登录后立即回到登录页**：
+   在生产模式下 `SESSION_COOKIE_SECURE=true`，浏览器要求必须通过 HTTPS 协议传输 Cookie。如果是本机测试，请通过 `http://localhost:8080` 或 `http://127.0.0.1:8080` 访问。
+4. **下载 Release 产物速度缓慢**：
+   在中国大陆网络环境下，请在安装时添加 `--mirror cn` 参数，脚本将自动选择高速代理节点下载产物包。

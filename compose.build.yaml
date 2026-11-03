@@ -1,0 +1,10 @@
+services:
+  certmate:
+    build:
+      context: .
+      dockerfile: Dockerfile.source
+      args:
+        VERSION: "${CERTMATE_BUILD_VERSION:-local}"
+        ACME_SH_VERSION: 3.1.4
+        ACME_SH_SHA256: e5f8e187bbf5251e0cd8891f2622daab9850366bd17bea9f92c2fe2ee091fd32
+    image: "${CERTMATE_IMAGE:-certmate:local}"
