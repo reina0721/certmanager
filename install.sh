@@ -409,9 +409,16 @@ fi
 set_env_key "SESSION_SECRET" "${SESSION_SECRET}"
 set_env_key "APP_ENCRYPTION_KEY" "${ENCRYPTION_KEY}"
 
-# 创建持久化目录
+# 创建持久化目录并赋予容器运行用户读写权限 (默认 APP_UID:APP_GID 为 10001:10001)
+APP_UID=10001
+APP_GID=10001
 mkdir -p "$TARGET_DIR/data" "$TARGET_DIR/certs"
-chmod 700 "$TARGET_DIR/data" "$TARGET_DIR/certs" 2>/dev/null || true
+if [[ $(id -u) -eq 0 ]]; then
+    chown -R "${APP_UID}:${APP_GID}" "$TARGET_DIR/data" "$TARGET_DIR/certs" 2>/dev/null || true
+    chmod 750 "$TARGET_DIR/data" "$TARGET_DIR/certs" 2>/dev/null || true
+else
+    chown -R "${APP_UID}:${APP_GID}" "$TARGET_DIR/data" "$TARGET_DIR/certs" 2>/dev/null || chmod 777 "$TARGET_DIR/data" "$TARGET_DIR/certs" 2>/dev/null || true
+fi
 
 log "配置文件初始化完成: ${ENV_FILE}"
 
